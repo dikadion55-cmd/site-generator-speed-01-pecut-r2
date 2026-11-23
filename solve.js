@@ -16,8 +16,9 @@ const byCodeUnits = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
 const ESCMAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 const ESC_RE = /[&<>"']/g;
+const ESC_TEST = /[&<>"']/;
 function esc(s) {
-  if (s.indexOf('&') === -1 && s.indexOf('<') === -1 && s.indexOf('>') === -1 && s.indexOf('"') === -1 && s.indexOf("'") === -1) return s;
+  if (!ESC_TEST.test(s)) return s;
   return s.replace(ESC_RE, (c) => ESCMAP[c]);
 }
 function escChar(c) {
@@ -249,60 +250,76 @@ ESC_ENT[39] = '&#39;';
 // per-character JS loop.
 const SPEC_RE = /[\\`*\[&<>"']/g;
 
+// Count the run of '\' immediately before j (not before `from`): a closer
+// is escaped iff that run has odd length (the run pairs up left to right,
+// and a trailing lone '\' escapes the next char, which is escapable here).
+function escapedRun(s, j, from) {
+  let bs = 0;
+  let k = j - 1;
+  while (k >= from && s.charCodeAt(k) === 92) { bs++; k--; }
+  return bs % 2 === 1;
+}
+
 function findStrong(s, from, limit) {
-  for (let j = from; j + 1 < limit; j++) {
-    const c = s.charCodeAt(j);
-    if (c === 92 && j + 1 < limit && ESCAPABLE_CODE[s.charCodeAt(j + 1)] === 1) { j++; continue; }
-    if (c === 42 && s.charCodeAt(j + 1) === 42) return j;
+  let j = s.indexOf('**', from);
+  while (j !== -1 && j + 1 < limit) {
+    if (!escapedRun(s, j, from)) return j;
+    j = s.indexOf('**', j + 1);
   }
   return -1;
 }
 
 function findSingleStar(s, from, limit) {
-  for (let j = from; j < limit; j++) {
-    const c = s.charCodeAt(j);
-    if (c === 92 && j + 1 < limit && ESCAPABLE_CODE[s.charCodeAt(j + 1)] === 1) { j++; continue; }
-    if (c !== 42) continue;
-    if (s.charCodeAt(j + 1) === 42) { j++; continue; }
+  let j = s.indexOf('*', from);
+  while (j !== -1 && j < limit) {
+    if (escapedRun(s, j, from)) { j = s.indexOf('*', j + 1); continue; }
+    if (s.charCodeAt(j + 1) === 42) { j = s.indexOf('*', j + 2); continue; }
     return j;
   }
   return -1;
 }
 
 function findCloseBracket(s, from, limit) {
-  for (let j = from; j < limit; j++) {
-    const c = s.charCodeAt(j);
-    if (c === 92 && j + 1 < limit && ESCAPABLE_CODE[s.charCodeAt(j + 1)] === 1) { j++; continue; }
-    if (c === 93) return j;
+  let j = s.indexOf(']', from);
+  while (j !== -1 && j < limit) {
+    if (!escapedRun(s, j, from)) return j;
+    j = s.indexOf(']', j + 1);
   }
   return -1;
 }
 
-// Iterative inline renderer. `out` is an array of string pieces. Frames hold
-// the buffer of a strong/em/link whose closer was already found ahead, so
-// content is scanned once and never re-sliced for recursion.
+// Iterative inline renderer. `out` is an array of string pieces. Frames are
+// held in one flat stack (5 slots each: kind, end, start, href, after), so
+// no per-frame object or buffer array is allocated: a frame's content
+// accumulates in `out` from `start` and is sliced out on close. A frame is
+// only pushed after its closer was found ahead, so content is scanned once
+// and never re-sliced for recursion.
 function inlineInto(s, link, out) {
-  const stack = [];
-  let cur = out;
+  const st = [];
   let limit = s.length;
   let i = 0;
   let run = 0;
   const flush = (to) => {
-    if (to > run) cur.push(s.slice(run, to)); // segments hold no specials: they are broken out below
+    if (to > run) out.push(s.slice(run, to)); // segments hold no specials: they are broken out below
   };
   while (i < s.length) {
     // A frame ends exactly here: close it.
-    if (stack.length !== 0 && i === stack[stack.length - 1].end) {
-      const f = stack.pop();
-      flush(f.end);
-      const inner = f.buf.join('');
-      if (f.kind === 2) { i = f.after; run = i; }
-      else { i = f.end + (f.kind === 0 ? 2 : 1); run = i; }
-      cur = stack.length === 0 ? out : stack[stack.length - 1].buf;
-      limit = stack.length === 0 ? s.length : stack[stack.length - 1].end;
-      if (f.kind === 0) cur.push('<strong>' + inner + '</strong>');
-      else if (f.kind === 1) cur.push('<em>' + inner + '</em>');
-      else cur.push('<a href="' + esc(f.href) + '">' + inner + '</a>');
+    if (st.length !== 0 && i === st[st.length - 4]) {
+      const kind = st[st.length - 5];
+      const end = st[st.length - 4];
+      const start = st[st.length - 3];
+      const href = st[st.length - 2];
+      const after = st[st.length - 1];
+      flush(end);
+      const inner = out.slice(start).join('');
+      out.length = start;
+      if (kind === 2) { i = after; run = i; }
+      else { i = end + (kind === 0 ? 2 : 1); run = i; }
+      st.length -= 5;
+      limit = st.length === 0 ? s.length : st[st.length - 4];
+      if (kind === 0) out.push('<strong>' + inner + '</strong>');
+      else if (kind === 1) out.push('<em>' + inner + '</em>');
+      else out.push('<a href="' + esc(href) + '">' + inner + '</a>');
       continue;
     }
     // Jump (one regex scan) to the next special at or after i.
@@ -314,7 +331,7 @@ function inlineInto(s, link, out) {
     if (cc === 92) { // backslash
       if (i + 1 < limit && ESCAPABLE_CODE[s.charCodeAt(i + 1)] === 1) {
         flush(i);
-        cur.push(escChar(s[i + 1]));
+        out.push(escChar(s[i + 1]));
         i += 2;
         run = i;
       } else {
@@ -326,7 +343,7 @@ function inlineInto(s, link, out) {
       const j = s.indexOf('`', i + 1);
       if (j > i + 1 && j < limit) {
         flush(i);
-        cur.push('<code>' + esc(s.slice(i + 1, j)) + '</code>');
+        out.push('<code>' + esc(s.slice(i + 1, j)) + '</code>');
         i = j + 1;
         run = i;
       } else {
@@ -339,15 +356,13 @@ function inlineInto(s, link, out) {
         const j = findStrong(s, i + 2, limit);
         if (j > i + 2) {
           flush(i);
-          const buf = [];
-          stack.push({ kind: 0, end: j, buf });
-          cur = buf;
+          st.push(0, j, out.length, '', 0);
           limit = j;
           i += 2;
           run = i;
         } else {
           flush(i);
-          cur.push('**');
+          out.push('**');
           i += 2;
           run = i;
         }
@@ -355,9 +370,7 @@ function inlineInto(s, link, out) {
         const j = findSingleStar(s, i + 1, limit);
         if (j > i + 1) {
           flush(i);
-          const buf = [];
-          stack.push({ kind: 1, end: j, buf });
-          cur = buf;
+          st.push(1, j, out.length, '', 0);
           limit = j;
           i += 1;
           run = i;
@@ -376,9 +389,7 @@ function inlineInto(s, link, out) {
           const target = s.slice(k + 2, mm);
           if (target !== '' && !/\s/.test(target)) {
             flush(i);
-            const buf = [];
-            stack.push({ kind: 2, end: k, buf, href: link(target), after: mm + 1 });
-            cur = buf;
+            st.push(2, k, out.length, link(target), mm + 1);
             limit = k;
             i += 1;
             run = i;
@@ -391,7 +402,7 @@ function inlineInto(s, link, out) {
     }
     // An HTML special: flush the plain run and push its entity.
     flush(i);
-    cur.push(ESC_ENT[cc]);
+    out.push(ESC_ENT[cc]);
     i++;
     run = i;
   }
@@ -482,8 +493,14 @@ function isContinued(l) {
   return c > 32 && c !== 160 && c !== 0x1680 && !(c >= 0x2000 && c <= 0x200a) && c !== 0x2028 && c !== 0x2029 && c !== 0x202f && c !== 0x205f && c !== 0x3000 && c !== 0xfeff;
 }
 
-function endsParagraph(l) {
-  return isBlankLine(l) || fenceLang(l) !== null || headingOf(l) !== null || isHR(l);
+function isBlockStart(l) {
+  if (l.length === 0) return true;
+  const c0 = l.charCodeAt(0);
+  if (c0 === 32 || c0 === 9) return isBlankLine(l);
+  if (c0 === 96) return fenceLang(l) !== null;
+  if (c0 === 35) return headingOf(l) !== null;
+  if (c0 === 45 || c0 === 42) return isHR(l);
+  return false;
 }
 
 // Render one body's lines. Returns { html, toc, excerpt }.
@@ -496,27 +513,31 @@ function renderMarkdown(lines, link, slugCache) {
   const n = lines.length;
   while (i < n) {
     const line = lines[i];
-    if (isBlankLine(line)) { i++; continue; }
-    const lang = fenceLang(line);
-    if (lang !== null) {
-      out.push(lang === '' ? '<pre><code>' : '<pre><code class="language-' + lang + '">');
-      i++;
-      while (i < n && !isFenceClose(lines[i])) { out.push(esc(lines[i])); out.push('\n'); i++; }
-      i++; // skip the close line, or past the end
-      out.push('</code></pre>\n');
-      continue;
-    }
-    const h = headingOf(line);
-    if (h !== null) {
-      const id = uniqueSlug(slugify(h.text, slugCache), ids);
-      const html = inlineStr(h.text, link);
-      out.push('<h' + h.depth + ' id="' + id + '">' + html + '</h' + h.depth + '>\n');
-      if (h.depth === 2 || h.depth === 3) toc.push({ level: h.depth, id, html });
-      i++;
-      continue;
-    }
-    if (isHR(line)) { out.push('<hr>\n'); i++; continue; }
-    if (line.charCodeAt(0) === 62) { // '>'
+    const c0 = line.charCodeAt(0);
+    if (line.length === 0 || ((c0 === 32 || c0 === 9) && isBlankLine(line))) { i++; continue; }
+    if (c0 === 96) {
+      const lang = fenceLang(line);
+      if (lang !== null) {
+        out.push(lang === '' ? '<pre><code>' : '<pre><code class="language-' + lang + '">');
+        i++;
+        while (i < n && !isFenceClose(lines[i])) { out.push(esc(lines[i])); out.push('\n'); i++; }
+        i++; // skip the close line, or past the end
+        out.push('</code></pre>\n');
+        continue;
+      }
+    } else if (c0 === 35) {
+      const h = headingOf(line);
+      if (h !== null) {
+        const id = uniqueSlug(slugify(h.text, slugCache), ids);
+        const html = inlineStr(h.text, link);
+        out.push('<h' + h.depth + ' id="' + id + '">' + html + '</h' + h.depth + '>\n');
+        if (h.depth === 2 || h.depth === 3) toc.push({ level: h.depth, id, html });
+        i++;
+        continue;
+      }
+    } else if (c0 === 45 || c0 === 42) {
+      if (isHR(line)) { out.push('<hr>\n'); i++; continue; }
+    } else if (c0 === 62) { // '>'
       const body = [];
       while (i < n && lines[i].charCodeAt(0) === 62) {
         let l = lines[i];
@@ -594,7 +615,7 @@ function renderMarkdown(lines, link, slugCache) {
     // paragraph needs its HTML as a string (the excerpt).
     const body = [trimLine(line)];
     i++;
-    while (i < n && !endsParagraph(lines[i])) { body.push(trimLine(lines[i])); i++; }
+    while (i < n && !isBlockStart(lines[i])) { body.push(trimLine(lines[i])); i++; }
     const pStart = out.length;
     out.push('<p>');
     inlineInto(body.join('\n'), link, out);
@@ -789,6 +810,41 @@ function compileTemplate(nodes) {
   return fn;
 }
 
+// True when a template's output is fully determined by the case-global
+// scope (site/tags/recent) plus loop variables bound by its own for-loops
+// over case-determined collections. Such a template renders identically
+// for every page in the case, so it can be rendered once and cached.
+// `determined` holds the case-determined names in scope; `visiting`
+// guards include cycles (conservative: a cycle is not hoistable).
+const CASE_GLOBALS = new Set(['site', 'tags', 'recent']);
+function isCaseDetermined(nodes, determined, parsed, visiting) {
+  for (const n of nodes) {
+    if (n.kind === 'text') continue;
+    if (n.kind === 'var' || n.kind === 'raw') {
+      if (!determined.has(n.path[0])) return false;
+    } else if (n.kind === 'if') {
+      if (!determined.has(n.path[0])) return false;
+      if (!isCaseDetermined(n.then, determined, parsed, visiting)) return false;
+      if (n.else !== null && !isCaseDetermined(n.else, determined, parsed, visiting)) return false;
+    } else if (n.kind === 'for') {
+      if (!determined.has(n.path[0])) return false;
+      const d2 = new Set(determined);
+      d2.add(n.name);
+      d2.add('loop');
+      if (!isCaseDetermined(n.body, d2, parsed, visiting)) return false;
+    } else if (n.kind === 'include') {
+      const sub = parsed.get(n.name);
+      if (sub === undefined) continue;
+      if (visiting.has(n.name)) return false;
+      visiting.add(n.name);
+      const ok = isCaseDetermined(sub, determined, parsed, visiting);
+      visiting.delete(n.name);
+      if (!ok) return false;
+    }
+  }
+  return true;
+}
+
 // ---------------------------------------------------------------- build
 
 const RESERVED = ['posts', 'tags', 'page'];
@@ -818,10 +874,13 @@ export function run(input) {
 
   // Templates, parsed in code-unit order of name.
   const templates = new Map();
+  const parsed = new Map();
   const tplNames = Object.keys(input.templates).sort(byCodeUnits);
   for (const name of tplNames) {
     try {
-      templates.set(name, compileTemplate(tplParse(name, input.templates[name])));
+      const nodes = tplParse(name, input.templates[name]);
+      parsed.set(name, nodes);
+      templates.set(name, compileTemplate(nodes));
     } catch (err) {
       if (!(err instanceof TemplateError)) throw err;
       report.push(err.message);
@@ -1028,16 +1087,38 @@ export function run(input) {
   const site = { title: input.site.title, base_url: base };
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
+  // Hoist case-determined templates: render once per case, cache the string.
+  {
+    const hoistScope = Object.create(null);
+    hoistScope.site = site;
+    hoistScope.tags = allTags;
+    hoistScope.recent = recent;
+    for (const name of tplNames) {
+      const nodes = parsed.get(name);
+      if (nodes === undefined) continue;
+      if (!isCaseDetermined(nodes, CASE_GLOBALS, parsed, new Set([name]))) continue;
+      const fn = templates.get(name);
+      if (fn === undefined) continue;
+      const out = [];
+      fn(out, hoistScope, templates, 0);
+      const str = out.join('');
+      templates.set(name, (o) => { o.push(str); });
+    }
+  }
+  const renderScope = Object.create(null);
+  renderScope.site = site;
+  renderScope.tags = allTags;
+  renderScope.recent = recent;
   const render = (name, vars) => {
     const fn = templates.get(name);
     if (fn === undefined) return null;
-    const $s = Object.create(null);
-    $s.site = site;
-    $s.tags = allTags;
-    $s.recent = recent;
-    for (const k of Object.keys(vars)) $s[k] = vars[k];
+    renderScope.page = undefined;
+    renderScope.posts = undefined;
+    renderScope.pager = undefined;
+    renderScope.tag = undefined;
+    for (const k of Object.keys(vars)) renderScope[k] = vars[k];
     const out = [];
-    fn(out, $s, templates, 0);
+    fn(out, renderScope, templates, 0);
     return out.join('');
   };
   for (const s of sources) output[s.outDir + '/index.html'] = render(s.layout, { page: pageOf(s) });
