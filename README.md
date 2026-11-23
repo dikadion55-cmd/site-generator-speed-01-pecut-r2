@@ -20,5 +20,5 @@ No native code, no WASM, no prebuilt binaries, no hardcoded answers, no cross-ca
 
 ## Results (local, practice set, 3/3 cases)
 
-- `grade-local --driver process`: 3/3 cases passed.
-- Cold bench (fresh `node main.ts` per run): median ~629,000 µs — roughly at parity with the previous entry (r1, ~592,000 µs), below the submit bar. See the build report for details.
+- `grade-local --driver process`: 3/3 cases passed, checks 3/3.
+- Cold bench (fresh `node main.ts` per run, 5–7 runs): median ~570,000–600,000 µs — essentially at parity with the previous entry (r1, ~587,000–592,000 µs on the same machine), below the submit bar (≥1.5× better, ideally <350,000 µs). **Verdict: MENTOK — do not submit.** The fresh rewrite matches r1 but does not beat it clearly; the remaining gap (~35%) would need a fundamentally faster markdown/template approach, not incremental tuning.
